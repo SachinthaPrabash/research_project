@@ -3,6 +3,8 @@ import pickle as pkl
 from os.path import join
 from collections import Counter
 
+START_TOKEN, PAD_TOKEN, END_TOKEN, UNK_TOKEN = 0, 1, 2, 3
+
 class Vocab(object):
   def __init__(self):
     self.sign_to_id = {"<s>": START_TOKEN, "</s>": END_TOKEN, "<pad>": PAD_TOKEN, "<unk>": UNK_TOKEN}
@@ -52,7 +54,6 @@ def load_vocab(data_dir):
   return vocab
 
 if __name__ == "__main__":
-  START_TOKEN, PAD_TOKEN, END_TOKEN, UNK_TOKEN = 0, 1, 2, 3
   parser = argparse.ArgumentParser(description="Building vocab for Im2Latex")
   parser.add_argument("--data_path", type=str, default="./data/", help="The dataset's dir")
   args = parser.parse_args()
