@@ -1,10 +1,11 @@
 
-import argparse
 from os.path import join
+import argparse
 
-import torch
 from PIL import Image
 from torchvision import transforms
+import torch
+
 
 def preprocess(data_dir, split):
     assert split in ["train", "validate", "test"]
@@ -35,9 +36,11 @@ def preprocess(data_dir, split):
     torch.save(pairs, out_file)
     print("Save {} dataset to {}".format(split, out_file))
 
+
 def img_size(pair):
     img, formula = pair
     return tuple(img.size())
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
