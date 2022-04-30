@@ -1,272 +1,205 @@
 import torch
 
-"""
-Borrow from https://github.com/allenai/allennlp/blob/master/allennlp/nn/beam_search.py
-"""
+from build_vocab import END_TOKEN, PAD_TOKEN, START_TOKEN
+from .beam_search import BeamSearch
 
 
-class BeamSearch:
+class LatexProducer(object):
     """
-    Implements the beam search algorithm for decoding the most likely sequences.
-
-    Parameters
-    ----------
-    end_index : ``int``
-        The index of the "stop" or "end" token in the target vocabulary.
-    max_steps : ``int``, optional (default = 50)
-        The maximum number of decoding steps to take, i.e. the maximum length
-        of the predicted sequences.
-    beam_size : ``int``, optional (default = 10)
-        The width of the beam used.
-    per_node_beam_size : ``int``, optional (default = beam_size)
-        The maximum number of candidates to consider per node, at each step in the search.
-        If not given, this just defaults to ``beam_size``. Setting this parameter
-        to a number smaller than ``beam_size`` may give better results, 
-        as it can introduce more diversity into the search. 
-        See `Beam Search Strategies for Neural Machine Translation.
-        Freitag and Al-Onaizan, 2017 <http://arxiv.org/abs/1702.01806>`_.
+    Model wrapper, implementing batch greedy decoding and
+    batch beam search decoding
     """
 
-    def __init__(self,
-                 end_index: int,
-                 max_steps: int = 50,
-                 beam_size: int = 10,
-                 per_node_beam_size: int = None) -> None:
-        self._end_index = end_index
-        self.max_steps = max_steps
+    def __init__(self, model, vocab, beam_size=5, max_len=64, use_cuda=True):
+        """args:
+            the path to model checkpoint
+        """
+        self.device = torch.device("cuda" if use_cuda else "cpu")
+        self.model = model.to(self.device)
+        self._sign2id = vocab.sign2id
+        self._id2sign = vocab.id2sign
+        self.max_len = max_len
         self.beam_size = beam_size
-        self.per_node_beam_size = per_node_beam_size or beam_size
+        self._beam_search = BeamSearch(END_TOKEN, max_len, beam_size)
 
-    def search(self, start_predictions, start_state, step):
+    def __call__(self, imgs):
+        """args:
+            imgs: images need to be decoded
+            beam_size: if equal to 1, use greedy decoding
+           returns:
+            formulas list of batch_size length
         """
-        Given a starting state and a step function, apply beam search to find the
-        most likely target sequences.
+        if self.beam_size == 1:
+            results = self._greedy_decoding(imgs)
+        else:
+            results = self._batch_beam_search(imgs)
+        return results
 
-        Notes
-        -----
-        If your step function returns ``-inf`` for some log probabilities
-        (like if you're using a masked log-softmax) then some of the "best"
-        sequences returned may also have ``-inf`` log probability. Specifically
-        this happens when the beam size is smaller than the number of actions
-        with finite log probability (non-zero probability) returned by the step function.
-        Therefore if you're using a mask you may want to check the results from ``search``
-        and potentially discard sequences with non-finite log probability.
+    def _greedy_decoding(self, imgs):
+        imgs = imgs.to(self.device)
+        self.model.eval()
 
-        Parameters
-        ----------
-        start_predictions : ``torch.Tensor``
-            A tensor containing the initial predictions with shape ``(batch_size,)``.
-            Usually the initial predictions are just the index of the "start" token
-            in the target vocabulary.
-        start_state : ``dict``
-            The initial state passed to the ``step`` function. 
-            Each value of the state dict should be a tensor of shape ``(batch_size, *)``, 
-            where ``*`` means any other number of dimensions.
-        step : ``function``
-            A function that is responsible for computing the next most likely tokens,
-            given the current state and the predictions from the last time step.
-            The function should accept two arguments. The first being a tensor
-            of shape ``(group_size,)``, representing the index of the predicted
-            tokens from the last time step, and the second being the current state.
-            The ``group_size`` will be ``batch_size * beam_size``, except in the initial
-            step, for which it will just be ``batch_size``.
-            The function is expected to return a tuple, where the first element
-            is a tensor of shape ``(group_size, target_vocab_size)`` containing
-            the log probabilities of the tokens for the next step, and the second
-            element is the updated state. The tensor in the state should have shape
-            ``(group_size, *)``, where ``*`` means any other number of dimensions.
+        enc_outs = self.model.encode(imgs)
+        dec_states, O_t = self.model.init_decoder(enc_outs)
 
-        Returns
-        -------
-        Tuple[torch.Tensor, torch.Tensor]
-            Tuple of ``(predictions, log_probabilities)``, where ``predictions``
-            has shape ``(batch_size, beam_size, max_steps)`` and ``log_probabilities``
-            has shape ``(batch_size, beam_size)``.
+        batch_size = imgs.size(0)
+        # storing decoding results
+        formulas_idx = torch.ones(
+            batch_size, self.max_len, device=self.device).long() * PAD_TOKEN
+        # first decoding step's input
+        tgt = torch.ones(
+            batch_size, 1, device=self.device).long() * START_TOKEN
+        with torch.no_grad():
+            for t in range(self.max_len):
+                dec_states, O_t, logit = self.model.step_decoding(
+                    dec_states, O_t, enc_outs, tgt)
+
+                tgt = torch.argmax(logit, dim=1, keepdim=True)
+                formulas_idx[:, t:t + 1] = tgt
+        results = self._idx2formulas(formulas_idx)
+        return results
+
+    def _simple_beam_search_decoding(self, imgs):
+        """simpple beam search decoding (not support batch)"""
+        self.model.eval()
+        beam_results = [
+            self._bs_decoding(img.unsqueeze(0))
+            for img in imgs
+        ]
+        return beam_results
+
+    def _idx2formulas(self, formulas_idx):
+        """convert formula id matrix to formulas list"""
+        results = []
+        for id_ in formulas_idx:
+            id_list = id_.tolist()
+            result = []
+            for sign_id in id_list:
+                if sign_id != END_TOKEN:
+                    result.append(self._id2sign[sign_id])
+                else:
+                    break
+            results.append(" ".join(result))
+        return results
+
+    def _bs_decoding(self, img):
         """
-        batch_size = start_predictions.size()[0]
+        beam search decoding not support batch
+        args:
+            img: [1, C, H, W]
+            beam_size: int
+        return:
+            formulas in str format
+        """
+        self.model.eval()
+        img = img.to(self.device)
 
-        # List of (batch_size, beam_size) tensors. One for each time step. Does not
-        # include the start symbols, which are implicit.
-        predictions = []
+        # encoding
+        # img = img.unsqueeze(0)  # [1, C, H, W]
+        enc_outs = self.model.encode(img)  # [1, H*W, OUT_C]
 
-        # List of (batch_size, beam_size) tensors. One for each time step. None for
-        # the first.  Stores the index n for the parent prediction, i.e.
-        # predictions[t-1][i][n], that it came from.
-        backpointers = []
+        # prepare data for decoding
+        enc_outs = enc_outs.expand(self.beam_size, -1, -1)
+        # [Beam_size, dec_rnn_h]
+        dec_states, O_t = self.model.init_decoder(enc_outs)
 
-        # Calculate the first timestep. This is done outside the main loop
-        # because we are going from a single decoder input (the output from the
-        # encoder) to the top `beam_size` decoder outputs. On the other hand,
-        # within the main loop we are going from the `beam_size` elements of the
-        # beam to `beam_size`^2 candidates from which we will select the top
-        # `beam_size` elements for the next iteration.
-        # shape: (batch_size, num_classes)
-        start_class_log_probabilities, state = step(
-            start_predictions, start_state)
+        # store top k ids (k is less or equal to beam_size)
+        # in first decoding step, all they are  start token
+        topk_ids = torch.ones(
+            self.beam_size, device=self.device).long() * START_TOKEN
+        topk_log_probs = torch.Tensor([0.0] + [-1e10] * (self.beam_size - 1))
+        topk_log_probs = topk_log_probs.to(self.device)
+        seqs = torch.ones(
+            self.beam_size, 1, device=self.device).long() * START_TOKEN
+        # store complete sequences and corrosponing scores
+        complete_seqs = []
+        complete_seqs_scores = []
+        k = self.beam_size
+        vocab_size = len(self._sign2id)
+        with torch.no_grad():
+            for t in range(self.max_len):
+                dec_states, O_t, logit = self.model.step_decoding(
+                    dec_states, O_t, enc_outs, topk_ids.unsqueeze(1))
+                log_probs = torch.log(logit)  # [k, vocab_size]
 
-        num_classes = start_class_log_probabilities.size()[1]
+                log_probs += topk_log_probs.unsqueeze(1)
+                topk_log_probs, topk_ids = torch.topk(log_probs.view(-1), k)
 
-        # shape: (batch_size, beam_size), (batch_size, beam_size)
-        start_top_log_probabilities, start_predicted_classes = \
-            start_class_log_probabilities.topk(self.beam_size)
-        if self.beam_size == 1 and (start_predicted_classes == self._end_index).all():
-            print("Empty sequences predicted. You may want to "
-                  "increase the beam size or ensure "
-                  "your step function is working properly.")
-            return start_predicted_classes.unsqueeze(-1), start_top_log_probabilities
+                beam_index = topk_ids // vocab_size
+                topk_ids = topk_ids % vocab_size
 
-        # The log probabilities for the last time step.
-        # shape: (batch_size, beam_size)
-        last_log_probabilities = start_top_log_probabilities
+                seqs = torch.cat(
+                    [seqs.index_select(0, beam_index), topk_ids.unsqueeze(1)],
+                    dim=1
+                )
 
-        # shape: [(batch_size, beam_size)]
-        predictions.append(start_predicted_classes)
+                complete_inds = [
+                    ind for ind, next_word in enumerate(topk_ids)
+                    if next_word == END_TOKEN
+                ]
+                if t == (self.max_len-1):  # last_step, end all seqs
+                    complete_inds = list(range(len(topk_ids)))
 
-        # Log probability tensor that mandates that the end token is selected.
-        # shape: (batch_size * beam_size, num_classes)
-        log_probs_after_end = start_class_log_probabilities.new_full(
-            (batch_size * self.beam_size, num_classes),
-            float("-inf")
-        )
-        log_probs_after_end[:, self._end_index] = 0.
+                incomplete_inds = list(
+                    set(range(len(topk_ids))) - set(complete_inds)
+                )
+                if len(complete_inds) > 0:
+                    complete_seqs.extend(seqs[complete_inds])
+                    complete_seqs_scores.extend(topk_log_probs[complete_inds])
+                k -= len(complete_inds)
+                if k == 0:  # all beam finished
+                    break
 
-        # Set the same state for each element in the beam.
-        for key, state_tensor in state.items():
-            _, *last_dims = state_tensor.size()
-            # shape: (batch_size * beam_size, *)
-            state[key] = state_tensor.\
-                unsqueeze(1).\
-                expand(batch_size, self.beam_size, *last_dims).\
-                reshape(batch_size * self.beam_size, *last_dims)
+                # prepare for next step
+                seqs = seqs[incomplete_inds]
+                topk_ids = topk_ids[incomplete_inds]
+                topk_log_probs = topk_log_probs[incomplete_inds]
 
-        for timestep in range(self.max_steps - 1):
-            # shape: (batch_size * beam_size,)
-            last_predictions = predictions[-1].reshape(
-                batch_size * self.beam_size)
+                enc_outs = enc_outs[:k]
+                seleted = beam_index[incomplete_inds]
+                O_t = O_t[seleted]
+                dec_states = (dec_states[0][seleted],
+                              dec_states[1][seleted])
 
-            # If every predicted token from the last step is `self._end_index`,
-            # then we can stop early.
-            if (last_predictions == self._end_index).all():
-                break
+        i = complete_seqs_scores.index(max(complete_seqs_scores))
+        seq = complete_seqs[i][1:]
+        result = self._idx2formulas(seq.unsqueeze(0))[0]
+        return result
 
-            # Take a step. This get the predicted log probs of the next classes
-            # and updates the state.
-            # shape: (batch_size * beam_size, num_classes)
-            class_log_probabilities, state = step(last_predictions, state)
+    def _batch_beam_search(self, imgs):
+        self.model.eval()
+        imgs = imgs.to(self.device)
+        enc_outs = self.model.encode(imgs)  # [batch_size, H*W, OUT_C]
+        # enc_outs = enc_outs.expand(self.beam_size, -1, -1)
+        dec_states, O_t = self.model.init_decoder(enc_outs)
 
-            # shape: (batch_size * beam_size, num_classes)
-            last_predictions_expanded = last_predictions.unsqueeze(-1).expand(
-                batch_size * self.beam_size,
-                num_classes
-            )
+        batch_size = imgs.size(0)
+        start_predictions = torch.ones(
+            batch_size, device=self.device).long() * START_TOKEN
+        state = {}
+        state['h_t'] = dec_states[0]
+        state['c_t'] = dec_states[1]
+        state['o_t'] = O_t
+        state['enc_outs'] = enc_outs
+        all_top_k_predictions, log_probabilities = self._beam_search.search(
+            start_predictions, state, self._take_step)
 
-            # Here we are finding any beams where we predicted the end token in
-            # the previous timestep and replacing the distribution with a
-            # one-hot distribution, forcing the beam to predict the end token
-            # this timestep as well.
-            # shape: (batch_size * beam_size, num_classes)
-            cleaned_log_probabilities = torch.where(
-                last_predictions_expanded == self._end_index,
-                log_probs_after_end,
-                class_log_probabilities
-            )
+        all_top_predictions = all_top_k_predictions[:, 0, :]
+        all_top_predictions = self._idx2formulas(all_top_predictions)
+        return all_top_predictions
 
-            # shape (both): (batch_size * beam_size, per_node_beam_size)
-            top_log_probabilities, predicted_classes = \
-                cleaned_log_probabilities.topk(self.per_node_beam_size)
+    def _take_step(self, last_predictions, state):
+        dec_states = (state['h_t'], state['c_t'])
+        O_t = state['o_t']
+        enc_outs = state['enc_outs']
 
-            # Here we expand the last log probabilities to (batch_size * beam_size, per_node_beam_size)
-            # so that we can add them to the current log probs for this timestep.
-            # This lets us maintain the log probability of each element on the beam.
-            # shape: (batch_size * beam_size, per_node_beam_size)
-            expanded_last_log_probabilities = last_log_probabilities.\
-                unsqueeze(2).\
-                expand(batch_size, self.beam_size, self.per_node_beam_size).\
-                reshape(batch_size * self.beam_size, self.per_node_beam_size)
+        last_predictions = last_predictions.unsqueeze(1)
+        with torch.no_grad():
+            dec_states, O_t, logit = self.model.step_decoding(
+                dec_states, O_t, enc_outs, last_predictions)
 
-            # shape: (batch_size * beam_size, per_node_beam_size)
-            summed_top_log_probabilities = top_log_probabilities + \
-                expanded_last_log_probabilities
-
-            # shape: (batch_size, beam_size * per_node_beam_size)
-            reshaped_summed = summed_top_log_probabilities.\
-                reshape(batch_size, self.beam_size * self.per_node_beam_size)
-
-            # shape: (batch_size, beam_size * per_node_beam_size)
-            reshaped_predicted_classes = predicted_classes.\
-                reshape(batch_size, self.beam_size * self.per_node_beam_size)
-
-            # Keep only the top `beam_size` beam indices.
-            # shape: (batch_size, beam_size), (batch_size, beam_size)
-            restricted_beam_log_probs, restricted_beam_indices = reshaped_summed.topk(
-                self.beam_size)
-
-            # Use the beam indices to extract the corresponding classes.
-            # shape: (batch_size, beam_size)
-            restricted_predicted_classes = reshaped_predicted_classes.gather(
-                1, restricted_beam_indices)
-
-            predictions.append(restricted_predicted_classes)
-
-            # shape: (batch_size, beam_size)
-            last_log_probabilities = restricted_beam_log_probs
-
-            # The beam indices come from a `beam_size * per_node_beam_size` dimension where the
-            # indices with a common ancestor are grouped together. Hence
-            # dividing by per_node_beam_size gives the ancestor. (Note that this is integer
-            # division as the tensor is a LongTensor.)
-            # shape: (batch_size, beam_size)
-            backpointer = restricted_beam_indices / self.per_node_beam_size
-
-            backpointers.append(backpointer)
-
-            # Keep only the pieces of the state tensors corresponding to the
-            # ancestors created this iteration.
-            for key, state_tensor in state.items():
-                _, *last_dims = state_tensor.size()
-                # shape: (batch_size, beam_size, *)
-                expanded_backpointer = backpointer.\
-                    view(batch_size, self.beam_size, *([1] * len(last_dims))).\
-                    expand(batch_size, self.beam_size, *last_dims)
-
-                # shape: (batch_size * beam_size, *)
-                state[key] = state_tensor.\
-                    reshape(batch_size, self.beam_size, *last_dims).\
-                    gather(1, expanded_backpointer).\
-                    reshape(batch_size * self.beam_size, *last_dims)
-
-        if not torch.isfinite(last_log_probabilities).all():
-            print("Infinite log probabilities encountered. "
-                  "Some final sequences may not make sense. "
-                  "This can happen when the beam size is "
-                  "larger than the number of valid (non-zero "
-                  "probability) transitions that the step function produces.")
-
-        # Reconstruct the sequences.
-        # shape: [(batch_size, beam_size, 1)]
-        reconstructed_predictions = [predictions[-1].unsqueeze(2)]
-
-        # shape: (batch_size, beam_size)
-        cur_backpointers = backpointers[-1]
-
-        for timestep in range(len(predictions) - 2, 0, -1):
-            # shape: (batch_size, beam_size, 1)
-            cur_preds = predictions[timestep].gather(
-                1, cur_backpointers).unsqueeze(2)
-
-            reconstructed_predictions.append(cur_preds)
-
-            # shape: (batch_size, beam_size)
-            cur_backpointers = backpointers[timestep -
-                                            1].gather(1, cur_backpointers)
-
-        # shape: (batch_size, beam_size, 1)
-        final_preds = predictions[0].gather(1, cur_backpointers).unsqueeze(2)
-
-        reconstructed_predictions.append(final_preds)
-
-        # shape: (batch_size, beam_size, max_steps)
-        all_predictions = torch.cat(
-            list(reversed(reconstructed_predictions)), 2)
-
-        return all_predictions, last_log_probabilities
+        # update state
+        state['h_t'] = dec_states[0]
+        state['c_t'] = dec_states[1]
+        state['o_t'] = O_t
+        return (torch.log(logit), state)
