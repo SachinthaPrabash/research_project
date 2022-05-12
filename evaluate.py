@@ -52,7 +52,7 @@ def main():
   out_file = open(args.result_path, 'w')
   ref_file = open(args.ref_path, 'w')
 
-  latex_producer = LatexProducer(model, vocab, max_len=args.max_len, use_cuda=use_cuda, beam_size=args.beam_size)
+  latex_producer = LatexProducer(model, vocab, max_len=args.max_len, use_cuda=use_cuda, beam_size=1)
 
   for imgs, training_target, target_cal_loss in tqdm(data_loader):
     try:
